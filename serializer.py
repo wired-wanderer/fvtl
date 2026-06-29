@@ -29,11 +29,12 @@ from process_scanner import CLiveryGroup
 
 
 # ---------------------------------------------------------------------------
-# shapes形式のtype → shape_id マッピング（要拡張）
+# shapes形式のtype → shape_id マッピング
+# 確定: type=16(楕円) → shape_id=102
+# 未確認のtypeはKFPSエクスポートで確認するまでtypeの値をそのまま使う
 # ---------------------------------------------------------------------------
 
 SHAPE_TYPE_MAP: dict[int, int] = {
-    1:  SHAPE_RECT,     # 矩形（仮）
     16: SHAPE_ELLIPSE,  # 楕円（確定: 102）
 }
 
@@ -182,7 +183,7 @@ class ShapesConverter:
             data  = shape.get("data", [])
             color = shape.get("color", [255, 255, 255, 255])
 
-            shape_id = SHAPE_TYPE_MAP.get(stype, SHAPE_ELLIPSE)
+            shape_id = SHAPE_TYPE_MAP.get(stype, stype)  # 未知のtypeはそのままshape_idに使用
             r, g, b, a = (
                 int(color[0]) if len(color) > 0 else 255,
                 int(color[1]) if len(color) > 1 else 255,

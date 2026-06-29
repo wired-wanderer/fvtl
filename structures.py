@@ -15,7 +15,7 @@ structures.py — FH6 ビニールツール データ構造定義
   +0x76  color_b     u8
   +0x77  color_a     u8      255×(透明度/100)
   +0x78  mask        u8
-  +0x7A  shape_id    u8      楕円=102
+  +0x7A  shape_id    u16     楕円=102
 
 座標系:
   ゲーム座標は中心(0,0)、X範囲約±1119.5、Y範囲約±716.0
@@ -91,6 +91,7 @@ class LayerRecord:
 
         def f32(off): return struct.unpack_from("<f", data, off)[0]
         def u8(off):  return struct.unpack_from("<B", data, off)[0]
+        def u16(off): return struct.unpack_from("<H", data, off)[0]
 
         return cls(
             position_x = f32(OFF_POSITION_X),
@@ -104,7 +105,7 @@ class LayerRecord:
             color_b    = u8(OFF_COLOR_B),
             color_a    = u8(OFF_COLOR_A),
             mask       = u8(OFF_MASK),
-            shape_id   = u8(OFF_SHAPE_ID),
+            shape_id   = u16(OFF_SHAPE_ID),
             _ptr       = ptr,
         )
 
@@ -126,7 +127,7 @@ class LayerRecord:
             (OFF_COLOR_B,    struct.pack("<B", self.color_b)),
             (OFF_COLOR_A,    struct.pack("<B", self.color_a)),
             (OFF_MASK,       struct.pack("<B", self.mask)),
-            (OFF_SHAPE_ID,   struct.pack("<B", self.shape_id)),
+            (OFF_SHAPE_ID,   struct.pack("<H", self.shape_id)),
         ]
         return patches
 

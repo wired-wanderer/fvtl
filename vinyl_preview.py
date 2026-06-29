@@ -1,18 +1,15 @@
 """
-vinyl_preview.py — FH6 ビニールプレビューウィジェット
+vinyl_preview.py — FH6 ビニールプレビューウィジェット v2
 
-fhvファイルのレイヤーデータを読み取り、
-Qt の QPainter で楕円を描画してプレビューする。
+座標系（fhv）:
+  pos_x: 0 〜 canvas_w  （JSONのcxそのまま）
+  pos_y: -canvas_h 〜 0  （JSONのcyを反転済み）
 
-座標変換（fhv → ウィジェット座標）:
-  fhv の pos_x は JSONのcxそのまま (0〜canvas_w)
-  fhv の pos_y は JSONのcyを反転  (-canvas_h〜0)
-  → widget_x = pos_x / canvas_w * widget_w
-  → widget_y = (-pos_y) / canvas_h * widget_h
-
-スケール変換:
-  fhv の scale_x = w / 63.0
-  → pixel_w = scale_x * 63.0 / canvas_w * widget_w
+描画変換:
+  widget_x = off_x + pos_x * sx
+  widget_y = off_y + (-pos_y) * sy   ← pos_yは負なので-で正にする
+  ellipse_w = scale_x * 63.0 * sx
+  ellipse_h = scale_y * 63.0 * sy
 """
 
 from __future__ import annotations
@@ -20,60 +17,53 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Optional
 
-from PyQt6.QtCore import QRectF, QSizeF, Qt, QPointF
-from PyQt6.QtGui import (
-    QBrush, QColor, QPainter, QPainterPath, QPen, QTransform,
-)
+from PyQt6.QtCore import QRectF, Qt
+from PyQt6.QtGui import QBrush, QColor, QPainter, QPen
 from PyQt6.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
 
-
-SCALE_DIVISOR = 63.0   # fhv scale → px の係数
-CANVAS_W      = 799.0
-CANVAS_H      = 1075.0
+SCALE_DIVISOR = 63.0
 
 
 class VinylPreviewWidget(QWidget):
-    """
-    fhv ファイルを読み込んでビニールをプレビュー描画するウィジェット。
-    アスペクト比を保ったままリサイズに対応する。
-    """
-
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._layers: list[dict] = []
-        self._canvas_w = CANVAS_W
-        self._canvas_h = CANVAS_H
+        self._canvas_w = 799.0
+        self._canvas_h = 1075.0
         self._loaded   = False
         self._label    = ""
-
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setMinimumSize(160, 160)
+        self.setMinimumSize(180, 200)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        # 背景色を明示的に設定
+        self.setAutoFillBackground(True)
+        p = self.palette()
+        p.setColor(self.backgroundRole(), QColor("#0d1117"))
+        self.setPalette(p)
 
     def load_fhv(self, path: Path | str) -> bool:
-        """fhvファイルを読み込む。成功したらTrueを返す。"""
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-
             canvas = data.get("canvas", {})
-            self._canvas_w = float(canvas.get("width",  CANVAS_W))
-            self._canvas_h = float(canvas.get("height", CANVAS_H))
+            self._canvas_w = float(canvas.get("width",  799.0))
+            self._canvas_h = float(canvas.get("height", 1075.0))
             self._layers   = data.get("layers", [])
             self._loaded   = True
             self._label    = Path(path).name
             self.update()
             return True
-        except Exception as e:
+        except Exception:
             self.clear()
             return False
 
     def clear(self) -> None:
-        """プレビューをクリアする。"""
-        self._layers  = []
-        self._loaded  = False
-        self._label   = ""
+        self._layers = []
+        self._loaded = False
+        self._label  = ""
         self.update()
 
     def paintEvent(self, event) -> None:
@@ -87,9 +77,8 @@ class VinylPreviewWidget(QWidget):
         painter.fillRect(0, 0, w, h, QColor("#0d1117"))
 
         if not self._loaded or not self._layers:
-            # 未ロード時のプレースホルダー
-            painter.setPen(QColor("#30363d"))
-            painter.drawRect(0, 0, w - 1, h - 1)
+            painter.setPen(QPen(QColor("#30363d"), 1))
+            painter.drawRect(1, 1, w - 2, h - 2)
             painter.setPen(QColor("#484f58"))
             painter.drawText(
                 QRectF(0, 0, w, h),
@@ -98,11 +87,11 @@ class VinylPreviewWidget(QWidget):
             )
             return
 
-        # キャンバスのアスペクト比を保ったまま描画領域を計算
-        aspect   = self._canvas_w / self._canvas_h
-        margin   = 8
-        avail_w  = w - margin * 2
-        avail_h  = h - margin * 2
+        # キャンバス描画領域（アスペクト比維持）
+        margin  = 10
+        avail_w = w - margin * 2
+        avail_h = h - margin * 2 - 18   # 下部ラベル分
+        aspect  = self._canvas_w / self._canvas_h
 
         if avail_w / avail_h > aspect:
             draw_h = avail_h
@@ -112,26 +101,31 @@ class VinylPreviewWidget(QWidget):
             draw_h = draw_w / aspect
 
         off_x = (w - draw_w) / 2
-        off_y = (h - draw_h) / 2
+        off_y = margin
 
         # キャンバス枠
-        painter.setPen(QPen(QColor("#21262d"), 1))
+        painter.setPen(QPen(QColor("#30363d"), 1))
+        painter.setBrush(QColor("#080c10"))
         painter.drawRect(QRectF(off_x, off_y, draw_w, draw_h))
+
+        # クリッピング（キャンバス外にはみ出さない）
+        painter.setClipRect(QRectF(off_x, off_y, draw_w, draw_h))
 
         # スケール係数
         sx = draw_w / self._canvas_w
         sy = draw_h / self._canvas_h
 
-        # レイヤーを描画（背面から）
+        # レイヤーを背面から描画
         for layer in reversed(self._layers):
             self._draw_layer(painter, layer, off_x, off_y, sx, sy)
 
-        # ファイル名ラベル
+        painter.setClipping(False)
+
+        # ファイル名
         painter.setPen(QColor("#484f58"))
-        painter.setFont(self.font())
         painter.drawText(
-            QRectF(margin, h - 20, w - margin * 2, 16),
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            QRectF(margin, off_y + draw_h + 2, w - margin * 2, 16),
+            Qt.AlignmentFlag.AlignCenter,
             self._label,
         )
 
@@ -142,8 +136,7 @@ class VinylPreviewWidget(QWidget):
         off_x: float, off_y: float,
         sx: float, sy: float,
     ) -> None:
-        """1レイヤーを描画する。"""
-        shape_id  = layer.get("shape_id", 102)
+        shape_id  = int(layer.get("shape_id", 102))
         pos_x     = float(layer.get("position_x", 0))
         pos_y     = float(layer.get("position_y", 0))
         scale_x   = float(layer.get("scale_x",   1))
@@ -151,63 +144,52 @@ class VinylPreviewWidget(QWidget):
         rotation  = float(layer.get("rotation",  0))
         color_arr = layer.get("color", [255, 255, 255, 255])
 
-        r = int(color_arr[0])
-        g = int(color_arr[1])
-        b = int(color_arr[2])
-        a = int(color_arr[3])
+        r = int(color_arr[0]) if len(color_arr) > 0 else 255
+        g = int(color_arr[1]) if len(color_arr) > 1 else 255
+        b = int(color_arr[2]) if len(color_arr) > 2 else 255
+        a = int(color_arr[3]) if len(color_arr) > 3 else 255
 
         # fhv座標 → ウィジェット座標
-        # pos_x: 0〜canvas_w そのまま
-        # pos_y: (-canvas_h)〜0 → Yを反転して 0〜canvas_h
+        # pos_y は負値（-canvas_h〜0）なので -pos_y で正にする
         cx = off_x + pos_x * sx
         cy = off_y + (-pos_y) * sy
 
-        # スケール値 → ピクセルサイズ
+        # スケール → ピクセルサイズ
         pw = scale_x * SCALE_DIVISOR * sx
         ph = scale_y * SCALE_DIVISOR * sy
 
         color = QColor(r, g, b, a)
-        painter.save()
 
-        # 中心に移動して回転
+        painter.save()
         painter.translate(cx, cy)
         painter.rotate(rotation)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(color))
 
         if shape_id == 102:
             # 楕円
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(color))
             painter.drawEllipse(QRectF(-pw / 2, -ph / 2, pw, ph))
         else:
-            # 矩形（shape_id=1 等）
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(color))
+            # 矩形（その他のshape_idは矩形で代替表示）
             painter.drawRect(QRectF(-pw / 2, -ph / 2, pw, ph))
 
         painter.restore()
 
 
 class VinylPreviewPanel(QWidget):
-    """
-    プレビューウィジェット + ラベルをまとめたパネル。
-    Export/Import タブから使う。
-    """
-
     def __init__(self, title: str = "Preview", parent=None) -> None:
         super().__init__(parent)
-        self._build(title)
-
-    def _build(self, title: str) -> None:
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
 
         self.title_label = QLabel(title)
-        self.title_label.setStyleSheet("color:#484f58;font-size:11px;font-weight:600;")
+        self.title_label.setStyleSheet(
+            "color:#484f58;font-size:11px;font-weight:600;"
+        )
         lay.addWidget(self.title_label)
 
         self.preview = VinylPreviewWidget()
-        self.preview.setStyleSheet("border-radius: 6px;")
         lay.addWidget(self.preview)
 
     def load_fhv(self, path: Path | str) -> bool:
