@@ -64,6 +64,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "log_group_found":    "CLiveryGroup発見: {n} レイヤー",
         "log_group_notfound": "CLiveryGroupが見つかりません。ビニールエディタを開いてください。",
         "log_saved":          "保存完了: {path}",
+        "log_png_saved":      "プレビュー画像を生成: {path}",
+        "log_png_failed":     "プレビュー画像の生成に失敗しました",
         "log_import_start":   "インポート開始: {name}",
         "log_loaded":         "{n} レイヤーを読み込みました",
         "log_layer_mismatch": "レイヤー数不一致: ファイル={f} / メモリ={m}",
@@ -108,6 +110,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "log_group_found":    "CLiveryGroup found: {n} layers",
         "log_group_notfound": "CLiveryGroup not found. Please open the vinyl editor.",
         "log_saved":          "Saved: {path}",
+        "log_png_saved":      "Preview image generated: {path}",
+        "log_png_failed":     "Failed to generate preview image",
         "log_import_start":   "Import started: {name}",
         "log_loaded":         "Loaded {n} layers",
         "log_layer_mismatch": "Layer count mismatch: file={f} / memory={m}",
@@ -165,10 +169,11 @@ class WorkerSignals(QObject):
 
 
 class ExportWorker(QThread):
-    def __init__(self, signals: WorkerSignals, out_path: Path) -> None:
+    def __init__(self, signals: WorkerSignals, out_dir: Path, stem: str) -> None:
         super().__init__()
-        self.signals  = signals
-        self.out_path = out_path
+        self.signals = signals
+        self.out_dir = out_dir   # vinyl/output/<stem>/ フォルダ
+        self.stem    = stem
 
     def run(self) -> None:
         try:
@@ -176,6 +181,7 @@ class ExportWorker(QThread):
             from memory_io import ProcessMemory
             from process_scanner import ProcessScanner
             from serializer import MemoryReader, FhvSerializer
+            from vinyl_renderer import render_vinyl_to_file
 
             mgr = VinylManager(verbose=False)
             self.signals.log.emit(I18n.t("log_connecting"), "info")
@@ -192,10 +198,26 @@ class ExportWorker(QThread):
                 reader = MemoryReader(pm)
                 vinyl  = reader.to_vinyl_file(group)
 
-            self.out_path.parent.mkdir(parents=True, exist_ok=True)
-            FhvSerializer.save(vinyl, self.out_path)
-            self.signals.log.emit(I18n.t("log_saved", path=self.out_path.name), "success")
-            self.signals.done.emit(True, str(self.out_path))
+            # <vinyl_dir>/output/<stem>/ フォルダを作成
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            fhv_path = self.out_dir / f"{self.stem}.fhv"
+            png_path = self.out_dir / f"{self.stem}.png"
+
+            FhvSerializer.save(vinyl, fhv_path)
+            self.signals.log.emit(I18n.t("log_saved", path=fhv_path.name), "success")
+
+            # プレビューPNGを同時生成
+            ok = render_vinyl_to_file(
+                [l.to_dict() for l in vinyl.layers],
+                png_path,
+                output_size=1024,
+            )
+            if ok:
+                self.signals.log.emit(I18n.t("log_png_saved", path=png_path.name), "success")
+            else:
+                self.signals.log.emit(I18n.t("log_png_failed"), "error")
+
+            self.signals.done.emit(True, str(fhv_path))
 
         except Exception as e:
             self.signals.log.emit(I18n.t("log_error", e=e), "error")
@@ -407,7 +429,9 @@ class ExportTab(QWidget):
         raw  = self.fn_edit.text().strip()
         stem = (raw.removesuffix(".fhv") if raw else
                 datetime.now().strftime("%Y%m%d%H%M%S"))
-        out_path = get_sub_dir("output") / f"{stem}.fhv"
+
+        # vinyl/output/<stem>/ フォルダの中に <stem>.fhv と <stem>.png を保存
+        out_dir = get_sub_dir("output") / stem
 
         self.export_btn.setEnabled(False)
         self.export_btn.setText(I18n.t("exporting"))
@@ -417,14 +441,19 @@ class ExportTab(QWidget):
         signals.log.connect(self.log.append_log)
         signals.done.connect(self._on_done)
 
-        self.worker = ExportWorker(signals, out_path)
+        self.worker = ExportWorker(signals, out_dir, stem)
         self.worker.start()
 
     def _on_done(self, ok: bool, saved_path: str) -> None:
         self.export_btn.setEnabled(True)
         self.export_btn.setText(I18n.t("btn_export"))
         if ok and saved_path:
-            self.preview_panel.load_fhv(saved_path)
+            # 同名のPNGを直接読み込む（再レンダリング不要で高速）
+            png_path = Path(saved_path).with_suffix(".png")
+            if png_path.exists():
+                self.preview_panel.load_png(png_path)
+            else:
+                self.preview_panel.load_fhv(saved_path)
         self.win.import_tab.refresh_table()
 
 
@@ -563,6 +592,16 @@ class ImportTab(QWidget):
         self.preview_panel.clear()
         self.refresh_table()
 
+    def _find_fhv_files(self, folder: Path) -> list[Path]:
+        """
+        output: <folder>/<stem>/<stem>.fhv の構成
+        generate/editor: <folder>/*.fhv の構成（直下）
+        両対応で探す。
+        """
+        direct = list(folder.glob("*.fhv"))
+        nested = list(folder.glob("*/*.fhv"))
+        return sorted(direct + nested, reverse=True)
+
     def refresh_table(self) -> None:
         self.table.setRowCount(0)
         self.hint.setVisible(False)
@@ -571,7 +610,7 @@ class ImportTab(QWidget):
 
         folder = get_vinyl_dir() / self.current_sub
         folder.mkdir(parents=True, exist_ok=True)
-        files = sorted(folder.glob("*.fhv"), reverse=True)
+        files = self._find_fhv_files(folder)
 
         if not files:
             self.table.setRowCount(1)
@@ -623,7 +662,13 @@ class ImportTab(QWidget):
             self.hint.setText(I18n.t("layer_hint", n=n))
             self.hint.setVisible(True)
             self.import_btn.setEnabled(True)
-            self.preview_panel.load_fhv(f)
+
+            # 同名PNGがあれば直接読み込み（再レンダリング不要で高速）
+            png_path = f.with_suffix(".png")
+            if png_path.exists():
+                self.preview_panel.load_png(png_path)
+            else:
+                self.preview_panel.load_fhv(f)
         except Exception:
             self.hint.setVisible(False)
             self.import_btn.setEnabled(False)

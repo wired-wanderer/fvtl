@@ -1,44 +1,42 @@
 """
-vinyl_preview.py — FH6 ビニールプレビューウィジェット v2
+vinyl_preview.py — FH6 ビニールプレビューウィジェット v6
 
-座標系（fhv）:
-  pos_x: 0 〜 canvas_w  （JSONのcxそのまま）
-  pos_y: -canvas_h 〜 0  （JSONのcyを反転済み）
-
-描画変換:
-  widget_x = off_x + pos_x * sx
-  widget_y = off_y + (-pos_y) * sy   ← pos_yは負なので-で正にする
-  ellipse_w = scale_x * 63.0 * sx
-  ellipse_h = scale_y * 63.0 * sy
+vinyl_renderer.py でPNGを生成し、それを表示するだけのシンプルな構成。
+SVGマスク方式は廃止し、JSON頂点メッシュの直接ラスタライズに統一。
 """
 
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 
 from PyQt6.QtCore import QRectF, Qt
-from PyQt6.QtGui import QBrush, QColor, QPainter, QPen
+from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
 
-SCALE_DIVISOR = 63.0
+from vinyl_renderer import render_vinyl
+
+
+def _pil_to_qpixmap(pil_img) -> QPixmap:
+    """PIL.Image(RGBA) → QPixmap 変換"""
+    data = pil_img.convert("RGBA").tobytes("raw", "RGBA")
+    qimg = QImage(data, pil_img.width, pil_img.height, QImage.Format.Format_RGBA8888)
+    return QPixmap.fromImage(qimg.copy())
 
 
 class VinylPreviewWidget(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._layers: list[dict] = []
-        self._canvas_w = 799.0
-        self._canvas_h = 1075.0
-        self._loaded   = False
-        self._label    = ""
-        self.setMinimumSize(180, 200)
+        self._pixmap: QPixmap | None = None
+        self._loaded  = False
+        self._label   = ""
+        self._error   = ""
+
+        self.setMinimumSize(200, 140)
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
-        # 背景色を明示的に設定
         self.setAutoFillBackground(True)
         p = self.palette()
         p.setColor(self.backgroundRole(), QColor("#0d1117"))
@@ -48,20 +46,54 @@ class VinylPreviewWidget(QWidget):
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            canvas = data.get("canvas", {})
-            self._canvas_w = float(canvas.get("width",  799.0))
-            self._canvas_h = float(canvas.get("height", 1075.0))
-            self._layers   = data.get("layers", [])
-            self._loaded   = True
-            self._label    = Path(path).name
+            layers = data.get("layers", [])
+
+            img = render_vinyl(layers, output_size=1024)
+            if img is None:
+                self._error = "描画対象がありません"
+                self.clear()
+                return False
+
+            self._pixmap = _pil_to_qpixmap(img)
+            self._loaded = True
+            self._label  = Path(path).name
+            self._error  = ""
             self.update()
             return True
-        except Exception:
+
+        except Exception as e:
+            self._error = str(e)
+            self.clear()
+            return False
+
+    def load_png(self, path: Path | str) -> bool:
+        """
+        事前生成済みのPNGを直接読み込む。
+        Export時に同時生成されたプレビュー画像を使うことで
+        毎回の再レンダリングを避け、表示を高速化する。
+        """
+        try:
+            pm = QPixmap(str(path))
+            if pm.isNull():
+                self._error = "PNG読み込み失敗"
+                self.clear()
+                return False
+
+            self._pixmap = pm
+            self._loaded = True
+            # ラベルは元のfhv名を表示したいので拡張子前の名前のみ
+            self._label  = Path(path).stem
+            self._error  = ""
+            self.update()
+            return True
+
+        except Exception as e:
+            self._error = str(e)
             self.clear()
             return False
 
     def clear(self) -> None:
-        self._layers = []
+        self._pixmap = None
         self._loaded = False
         self._label  = ""
         self.update()
@@ -69,29 +101,31 @@ class VinylPreviewWidget(QWidget):
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
         w = self.width()
         h = self.height()
-
-        # 背景
         painter.fillRect(0, 0, w, h, QColor("#0d1117"))
 
-        if not self._loaded or not self._layers:
+        if not self._loaded or self._pixmap is None:
             painter.setPen(QPen(QColor("#30363d"), 1))
             painter.drawRect(1, 1, w - 2, h - 2)
             painter.setPen(QColor("#484f58"))
+            msg = self._error if self._error else "No preview"
             painter.drawText(
-                QRectF(0, 0, w, h),
-                Qt.AlignmentFlag.AlignCenter,
-                "No preview",
+                QRectF(8, 0, w - 16, h),
+                Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                msg,
             )
             return
 
-        # キャンバス描画領域（アスペクト比維持）
-        margin  = 10
+        margin  = 12
+        label_h = 18
         avail_w = w - margin * 2
-        avail_h = h - margin * 2 - 18   # 下部ラベル分
-        aspect  = self._canvas_w / self._canvas_h
+        avail_h = h - margin * 2 - label_h
+
+        pm = self._pixmap
+        aspect = pm.width() / pm.height()
 
         if avail_w / avail_h > aspect:
             draw_h = avail_h
@@ -100,80 +134,23 @@ class VinylPreviewWidget(QWidget):
             draw_w = avail_w
             draw_h = draw_w / aspect
 
-        off_x = (w - draw_w) / 2
-        off_y = margin
+        off_x = (w - draw_w) / 2.0
+        off_y = margin + (avail_h - draw_h) / 2.0
 
-        # キャンバス枠
-        painter.setPen(QPen(QColor("#30363d"), 1))
-        painter.setBrush(QColor("#080c10"))
+        # 白背景の枠
+        painter.setPen(QPen(QColor("#cccccc"), 1))
+        painter.setBrush(QColor("#ffffff"))
         painter.drawRect(QRectF(off_x, off_y, draw_w, draw_h))
 
-        # クリッピング（キャンバス外にはみ出さない）
-        painter.setClipRect(QRectF(off_x, off_y, draw_w, draw_h))
+        target = QRectF(off_x, off_y, draw_w, draw_h)
+        painter.drawPixmap(target, pm, QRectF(0, 0, pm.width(), pm.height()))
 
-        # スケール係数
-        sx = draw_w / self._canvas_w
-        sy = draw_h / self._canvas_h
-
-        # レイヤーを背面から描画
-        for layer in reversed(self._layers):
-            self._draw_layer(painter, layer, off_x, off_y, sx, sy)
-
-        painter.setClipping(False)
-
-        # ファイル名
         painter.setPen(QColor("#484f58"))
         painter.drawText(
-            QRectF(margin, off_y + draw_h + 2, w - margin * 2, 16),
+            QRectF(off_x, off_y + draw_h + 2, draw_w, label_h),
             Qt.AlignmentFlag.AlignCenter,
             self._label,
         )
-
-    def _draw_layer(
-        self,
-        painter: QPainter,
-        layer: dict,
-        off_x: float, off_y: float,
-        sx: float, sy: float,
-    ) -> None:
-        shape_id  = int(layer.get("shape_id", 102))
-        pos_x     = float(layer.get("position_x", 0))
-        pos_y     = float(layer.get("position_y", 0))
-        scale_x   = float(layer.get("scale_x",   1))
-        scale_y   = float(layer.get("scale_y",   1))
-        rotation  = float(layer.get("rotation",  0))
-        color_arr = layer.get("color", [255, 255, 255, 255])
-
-        r = int(color_arr[0]) if len(color_arr) > 0 else 255
-        g = int(color_arr[1]) if len(color_arr) > 1 else 255
-        b = int(color_arr[2]) if len(color_arr) > 2 else 255
-        a = int(color_arr[3]) if len(color_arr) > 3 else 255
-
-        # fhv座標 → ウィジェット座標
-        # pos_y は負値（-canvas_h〜0）なので -pos_y で正にする
-        cx = off_x + pos_x * sx
-        cy = off_y + (-pos_y) * sy
-
-        # スケール → ピクセルサイズ
-        pw = scale_x * SCALE_DIVISOR * sx
-        ph = scale_y * SCALE_DIVISOR * sy
-
-        color = QColor(r, g, b, a)
-
-        painter.save()
-        painter.translate(cx, cy)
-        painter.rotate(rotation)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(color))
-
-        if shape_id == 102:
-            # 楕円
-            painter.drawEllipse(QRectF(-pw / 2, -ph / 2, pw, ph))
-        else:
-            # 矩形（その他のshape_idは矩形で代替表示）
-            painter.drawRect(QRectF(-pw / 2, -ph / 2, pw, ph))
-
-        painter.restore()
 
 
 class VinylPreviewPanel(QWidget):
@@ -182,18 +159,19 @@ class VinylPreviewPanel(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
-
         self.title_label = QLabel(title)
         self.title_label.setStyleSheet(
             "color:#484f58;font-size:11px;font-weight:600;"
         )
         lay.addWidget(self.title_label)
-
         self.preview = VinylPreviewWidget()
         lay.addWidget(self.preview)
 
     def load_fhv(self, path: Path | str) -> bool:
         return self.preview.load_fhv(path)
+
+    def load_png(self, path: Path | str) -> bool:
+        return self.preview.load_png(path)
 
     def clear(self) -> None:
         self.preview.clear()
