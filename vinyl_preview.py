@@ -10,8 +10,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from PyQt6.QtCore import QRectF, Qt
-from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PyQt6.QtCore import QRectF, Qt, QSize
+from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QBrush
 from PyQt6.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
 
 from vinyl_renderer import render_vinyl
@@ -25,6 +25,25 @@ def _pil_to_qpixmap(pil_img) -> QPixmap:
 
 
 class VinylPreviewWidget(QWidget):
+    # クラス変数としてキャッシュ（毎フレーム作り直さない）
+    _checker_brush: QBrush | None = None
+
+    @classmethod
+    def _get_checker_brush(cls, cell: int = 8) -> QBrush:
+        if cls._checker_brush is not None:
+            return cls._checker_brush
+
+        tile = QPixmap(QSize(cell * 2, cell * 2))
+        tile.fill(QColor("#ffffff"))
+        p = QPainter(tile)
+        p.fillRect(0, 0, cell, cell, QColor("#cccccc"))
+        p.fillRect(cell, cell, cell, cell, QColor("#cccccc"))
+        p.end()
+
+        brush = QBrush(tile)
+        cls._checker_brush = brush
+        return brush
+    
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._pixmap: QPixmap | None = None
@@ -139,7 +158,7 @@ class VinylPreviewWidget(QWidget):
 
         # 白背景の枠
         painter.setPen(QPen(QColor("#cccccc"), 1))
-        painter.setBrush(QColor("#ffffff"))
+        painter.setBrush(self._get_checker_brush())
         painter.drawRect(QRectF(off_x, off_y, draw_w, draw_h))
 
         target = QRectF(off_x, off_y, draw_w, draw_h)
