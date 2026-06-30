@@ -28,7 +28,7 @@ from PIL import Image, ImageDraw
 
 from shape_geometry import get_geometry_for_shape_id, ShapeGeometry
 
-SCALE_DIVISOR = 128.0   # fhv scale → ピクセル変換係数（実機計測で調整）
+SCALE_DIVISOR = 1.0   # fhv scale → ピクセル変換係数（実機計測で調整）
 
 
 @dataclass
@@ -77,8 +77,8 @@ def _transform_layer(layer: dict) -> TransformedShape | None:
 
     def to_world(lx: float, ly: float) -> tuple[float, float]:
         # 形状ローカル中心を原点に
-        nx = (lx - cx_local) / geom.width
-        ny = (ly - cy_local) / geom.height
+        nx = lx - cx_local
+        ny = ly - cy_local
         # レイヤーのピクセルサイズを適用
         sx = nx * scale_x
         sy = ny * scale_y
