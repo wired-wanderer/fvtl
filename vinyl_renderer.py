@@ -228,7 +228,7 @@ def render_vinyl_to_file(
     output_path: str | Path,
     output_size: int = 1024,
     padding_ratio: float = 0.04,
-    background: tuple[int, int, int, int] = (255, 255, 255, 255),
+    background: tuple[int, int, int, int] = (0, 0, 0, 0),
 ) -> bool:
     """render_vinylの結果をPNGファイルに保存する。成功したらTrue。"""
     img = render_vinyl(layers, output_size, padding_ratio, background)

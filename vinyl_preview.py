@@ -61,12 +61,12 @@ class VinylPreviewWidget(QWidget):
         p.setColor(self.backgroundRole(), QColor("#0d1117"))
         self.setPalette(p)
 
-    def load_fhv(self, path: Path | str) -> bool:
+    def load_layers(self, layers: list[dict], label: str = "") -> bool:
+        """
+        既にLayerRecord.to_dict()相当の辞書リストになっているものを直接描画する。
+        shapes形式から変換した結果など、.fhvを経由しないケースで使う。
+        """
         try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-            layers = data.get("layers", [])
-
             img = render_vinyl(layers, output_size=1024)
             if img is None:
                 self._error = "描画対象がありません"
@@ -75,11 +75,22 @@ class VinylPreviewWidget(QWidget):
 
             self._pixmap = _pil_to_qpixmap(img)
             self._loaded = True
-            self._label  = Path(path).name
+            self._label  = label
             self._error  = ""
             self.update()
             return True
 
+        except Exception as e:
+            self._error = str(e)
+            self.clear()
+            return False
+
+    def load_fhv(self, path: Path | str) -> bool:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            layers = data.get("layers", [])
+            return self.load_layers(layers, label=Path(path).name)
         except Exception as e:
             self._error = str(e)
             self.clear()
@@ -186,6 +197,9 @@ class VinylPreviewPanel(QWidget):
         self.preview = VinylPreviewWidget()
         lay.addWidget(self.preview)
 
+    def load_layers(self, layers: list[dict], label: str = "") -> bool:
+        return self.preview.load_layers(layers, label=label)
+    
     def load_fhv(self, path: Path | str) -> bool:
         return self.preview.load_fhv(path)
 

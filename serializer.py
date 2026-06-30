@@ -236,6 +236,28 @@ class FhvSerializer:
     """VinylFile ↔ .fhv (JSON) ファイルの変換"""
 
     @staticmethod
+    def load_any(path: str | Path, converter: CoordConverter | None = None) -> VinylFile:
+        """
+        .fhv形式 / shapes形式(既存Windowsツール互換) を自動判別して読み込み、
+        どちらも統一的に VinylFile として返す。
+        """
+        path = Path(path)
+        with path.open(encoding="utf-8") as f:
+            data = json.load(f)
+
+        if "shapes" in data:
+            layers = ShapesConverter(converter).convert(data)
+            return VinylFile(layers=layers)
+
+        if "layers" in data or "fhv_version" in data:
+            version = data.get("fhv_version", 0)
+            if version != VinylFile.FHV_VERSION:
+                print(f"[!] fhv_version={version} は未対応です（対応: {VinylFile.FHV_VERSION}）")
+            return VinylFile.from_dict(data)
+
+        raise ValueError(f"未対応のJSON形式です: {path.name}")
+    
+    @staticmethod
     def save(vinyl: VinylFile, path: str | Path) -> None:
         """VinylFileを.fhvファイルに保存"""
         path = Path(path)

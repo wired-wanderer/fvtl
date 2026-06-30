@@ -4,7 +4,7 @@ fh6vinyl.py — FH6 ビニールツール CLI エントリポイント
 使い方:
   python fh6vinyl.py export -o my_vinyl.fhv
   python fh6vinyl.py import-fhv -i my_vinyl.fhv
-  python fh6vinyl.py import-shapes -i shapes.json --canvas-w 799 --canvas-h 1075
+  python fh6vinyl.py import-shapes -i shapes.json
   python fh6vinyl.py scan
 """
 
@@ -67,8 +67,8 @@ def build_parser() -> argparse.ArgumentParser:
     # import-shapes
     p_ish = sub.add_parser("import-shapes", help="shapes JSON → メモリ インポート")
     p_ish.add_argument("-i", "--input",    required=True,  help="入力ファイル (shapes JSON)")
-    p_ish.add_argument("--canvas-w",       type=float, default=799.0,  help="キャンバス幅px (デフォルト: 799)")
-    p_ish.add_argument("--canvas-h",       type=float, default=1075.0, help="キャンバス高さpx (デフォルト: 1075)")
+    p_ish.add_argument("--canvas-w",       type=float, default=1920.0,  help="キャンバス幅px (デフォルト: 799)")
+    p_ish.add_argument("--canvas-h",       type=float, default=1080.0, help="キャンバス高さpx (デフォルト: 1075)")
     p_ish.add_argument("--strict",         action="store_true", help="レイヤー数不一致時にエラー")
     p_ish.add_argument("--save-fhv",       help="変換後を .fhv として保存するパス（任意）")
     p_ish.set_defaults(func=cmd_import_shapes)

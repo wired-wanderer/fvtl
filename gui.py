@@ -240,7 +240,7 @@ class ImportWorker(QThread):
             mgr = VinylManager(verbose=False)
             self.signals.log.emit(I18n.t("log_import_start", name=self.fhv_path.name), "info")
 
-            vinyl = FhvSerializer.load(self.fhv_path)
+            vinyl = FhvSerializer.load_any(self.fhv_path)   # ← load → load_any
             self.signals.log.emit(I18n.t("log_loaded", n=len(vinyl.layers)), "info")
             self.signals.log.emit(I18n.t("log_connecting"), "info")
 
@@ -592,15 +592,88 @@ class ImportTab(QWidget):
         self.preview_panel.clear()
         self.refresh_table()
 
-    def _find_fhv_files(self, folder: Path) -> list[Path]:
+    def _find_import_files(self, folder: Path) -> list[Path]:
         """
         output: <folder>/<stem>/<stem>.fhv の構成
-        generate/editor: <folder>/*.fhv の構成（直下）
-        両対応で探す。
+        generate/editor: <folder>/*.fhv または *.json(shapes形式) の構成（直下）
+        .fhv / .json 両対応で探す。
         """
-        direct = list(folder.glob("*.fhv"))
-        nested = list(folder.glob("*/*.fhv"))
+        patterns = ("*.fhv", "*.json")
+        direct = [p for pat in patterns for p in folder.glob(pat)]
+        nested = [p for pat in patterns for p in folder.glob(f"*/{pat}")]
         return sorted(direct + nested, reverse=True)
+    
+    def _migrated_dir_for(self, f: Path) -> Path:
+        return get_vinyl_dir() / "output" / f.stem
+
+    def _is_shapes_format(self, f: Path) -> bool:
+        if f.suffix != ".json":
+            return False
+        try:
+            with f.open(encoding="utf-8") as fp:
+                d = json.load(fp)
+            return "shapes" in d
+        except Exception:
+            return False
+
+    def _ensure_shapes_migrated(self, f: Path) -> Path:
+        """
+        shapes形式JSONを初回検出時に output/<stem>/ へ正規化する。
+          - 未配置なら移動
+          - プレビューPNG・レイヤー数キャッシュ(.layers.txt)が無ければ生成
+        既に正規化済みなら何もせずパスを返す（再変換しない）。
+        """
+        target_dir  = self._migrated_dir_for(f)
+        target_json = target_dir / f.name
+        count_txt   = target_dir / f"{f.stem}.layers.txt"
+        png_path    = target_dir / f"{f.stem}.png"
+
+        if f.parent == target_dir and count_txt.exists() and png_path.exists():
+            return f  # 正規化済み
+
+        from serializer import FhvSerializer
+        from vinyl_renderer import render_vinyl_to_file
+
+        vinyl = FhvSerializer.load_any(f)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        if f.parent != target_dir:
+            f = f.replace(target_json)
+            self.log.append_log(f"shapes形式を正規化: output/{f.parent.name}/ へ移動 ({f.name})", "info")
+
+        if not png_path.exists():
+            render_vinyl_to_file(
+                [l.to_dict() for l in vinyl.layers], png_path, output_size=1024,
+            )
+
+        if not count_txt.exists():
+            count_txt.write_text(str(len(vinyl.layers)), encoding="utf-8")
+
+        return f
+
+    def _layer_count_for(self, f: Path) -> str:
+        """レイヤー数表示用。キャッシュ優先、無ければフォールバックで変換。"""
+        count_txt = f.with_name(f"{f.stem}.layers.txt")
+        if count_txt.exists():
+            try:
+                return count_txt.read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+
+        try:
+            with f.open(encoding="utf-8") as fp:
+                d = json.load(fp)
+            if "layers" in d or "fhv_version" in d:
+                return str(d.get("layer_count", len(d.get("layers", []))))
+        except Exception:
+            pass
+
+        try:
+            from serializer import FhvSerializer
+            vinyl = FhvSerializer.load_any(f)
+            return str(len(vinyl.layers))
+        except Exception:
+            return "?"    
 
     def refresh_table(self) -> None:
         self.table.setRowCount(0)
@@ -610,7 +683,7 @@ class ImportTab(QWidget):
 
         folder = get_vinyl_dir() / self.current_sub
         folder.mkdir(parents=True, exist_ok=True)
-        files = self._find_fhv_files(folder)
+        files = self._find_import_files(folder)
 
         if not files:
             self.table.setRowCount(1)
@@ -622,6 +695,12 @@ class ImportTab(QWidget):
             return
 
         for f in files:
+            if self._is_shapes_format(f):
+                try:
+                    f = self._ensure_shapes_migrated(f)
+                except Exception as e:
+                    self.log.append_log(f"shapes正規化失敗: {f.name}: {e}", "error")
+
             row = self.table.rowCount()
             self.table.insertRow(row)
 
@@ -629,13 +708,7 @@ class ImportTab(QWidget):
             name_item.setData(Qt.ItemDataRole.UserRole, f)
             self.table.setItem(row, 0, name_item)
 
-            try:
-                with f.open() as fp:
-                    d = json.load(fp)
-                n = d.get("layer_count", len(d.get("layers", [])))
-                layer_item = QTableWidgetItem(str(n))
-            except Exception:
-                layer_item = QTableWidgetItem("?")
+            layer_item = QTableWidgetItem(self._layer_count_for(f))
             layer_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             layer_item.setForeground(QColor("#58a6ff"))
             self.table.setItem(row, 1, layer_item)
@@ -656,19 +729,20 @@ class ImportTab(QWidget):
             return
 
         try:
-            with f.open() as fp:
-                d = json.load(fp)
-            n = d.get("layer_count", len(d.get("layers", [])))
-            self.hint.setText(I18n.t("layer_hint", n=n))
+            n_text = self._layer_count_for(f)
+            self.hint.setText(I18n.t("layer_hint", n=n_text))
             self.hint.setVisible(True)
             self.import_btn.setEnabled(True)
 
-            # 同名PNGがあれば直接読み込み（再レンダリング不要で高速）
             png_path = f.with_suffix(".png")
             if png_path.exists():
                 self.preview_panel.load_png(png_path)
             else:
-                self.preview_panel.load_fhv(f)
+                from serializer import FhvSerializer
+                vinyl = FhvSerializer.load_any(f)
+                self.preview_panel.load_layers(
+                    [l.to_dict() for l in vinyl.layers], label=f.name
+                )
         except Exception:
             self.hint.setVisible(False)
             self.import_btn.setEnabled(False)
