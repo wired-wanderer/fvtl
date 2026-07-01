@@ -1,0 +1,13 @@
+diff --git a/internal/gpu/vulkan.go b/internal/gpu/vulkan.go
+index 5e23e42..158dc1e 100644
+--- a/internal/gpu/vulkan.go
++++ b/internal/gpu/vulkan.go
+@@ -3,6 +3,8 @@ package gpu
+ /*
+ #cgo windows CFLAGS: -IC:/VulkanSDK/1.4.350.0/Include
+ #cgo windows LDFLAGS: -LC:/VulkanSDK/1.4.350.0/Lib -lvulkan-1
++#cgo linux LDFLAGS: -lvulkan
++#cgo darwin LDFLAGS: -lvulkan
+ #include <stdlib.h>
+ #include <string.h>
+ #include <stdint.h>
