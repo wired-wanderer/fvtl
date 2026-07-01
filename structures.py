@@ -186,15 +186,14 @@ class CoordConverter:
       Y範囲: 0 〜 canvas_h      上がゼロ、下が大きい  ← 通常の画像座標
       cx, cy はシェイプの中心座標
     """
-    canvas_w: float = 799.0
-    canvas_h: float = 1075.0
+    canvas_w: float = 1920.0
+    canvas_h: float = 1080.0
     game_x_max: float = GAME_X_MAX
     game_y_max: float = GAME_Y_MAX
 
     def json_to_game_pos(self, cx: float, cy: float) -> tuple[float, float]:
         """JSON中心座標 → ゲーム座標
         
-        KFPSの実測から確定:
           game_x = cx        （そのままコピー）
           game_y = -cy       （Y符号反転のみ）
         正規化や倍率変換は不要。
@@ -208,7 +207,7 @@ class CoordConverter:
     def json_to_game_scale(self, w: float, h: float) -> tuple[float, float]:
         """JSONピクセルサイズ → ゲームスケール値
         
-        KFPSの実測から確定: 除数=63.0（全2500シェイプで誤差ゼロ）
+        除数=63.0（全2500シェイプで誤差ゼロ）
           scale_x = w / 63.0
           scale_y = h / 63.0
         """
@@ -233,8 +232,8 @@ class VinylFile:
 
     game:         str = "fh6"
     update_code:  str = "97723390891367"
-    canvas_w:     float = 799.0
-    canvas_h:     float = 1075.0
+    canvas_w:     float = 0.0
+    canvas_h:     float = 0.0
     layers:       list[LayerRecord] = field(default_factory=list)
 
     def to_dict(self) -> dict:

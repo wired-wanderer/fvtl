@@ -73,7 +73,7 @@ class MemoryReader:
     def to_vinyl_file(self, group: CLiveryGroup) -> VinylFile:
         """CLiveryGroupをVinylFileに変換（エクスポート用）"""
         layers = self.read_all_layers(group)
-        return VinylFile(layers=layers)
+        return FhvSerializer.build_vinyl_file(layers)   # ← VinylFile(layers=layers) から変更
 
 
 # ---------------------------------------------------------------------------
@@ -227,14 +227,112 @@ class ShapesConverter:
 
         return layers
 
+# ---------------------------------------------------------------------------
+# GeometrizeConverter — forza-painter-geometrize-gpu 出力 → LayerRecord リスト
+# ---------------------------------------------------------------------------
 
+class GeometrizeConverter:
+    """
+    forza-painter-geometrize-gpu の shapes[] 出力を LayerRecord リストに変換する。
+
+    shapes[].data の意味（engine.go toShape() 準拠、実データで検証済み）:
+      [cx, cy, rx, ry, rotation°]   rx, ry は半径。ゲーム座標への変換は
+      既存Windowsインポーターの実測(CoordConverter)と2500件全一致で確認済み:
+        position_x = cx
+        position_y = -cy
+        scale_x    = rx / 63.0      ← 半径をそのまま使う（2倍しない）
+        scale_y    = ry / 63.0
+        rotation   = (360 - rot) % 360
+    """
+
+    def __init__(self, converter: CoordConverter | None = None, verbose: bool = False) -> None:
+        self.conv    = converter or CoordConverter()
+        self.verbose = verbose
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(f"[GeometrizeConverter] {msg}")
+
+    def convert(self, shapes_data: dict) -> list[LayerRecord]:
+        shapes = shapes_data.get("shapes", [])
+        layers: list[LayerRecord] = []
+
+        for i, shape in enumerate(shapes):
+            stype = shape.get("type", 16)
+            data  = shape.get("data", [])
+            color = shape.get("color", [255, 255, 255, 255])
+
+            r, g, b, a = (
+                int(color[0]) if len(color) > 0 else 255,
+                int(color[1]) if len(color) > 1 else 255,
+                int(color[2]) if len(color) > 2 else 255,
+                int(color[3]) if len(color) > 3 else 255,
+            )
+
+            if stype == 1:
+                # 背景矩形はスキップ
+                self._log(f"shapes[{i}] type=1 (背景矩形) をスキップ")
+                continue
+
+            elif stype == 16 and len(data) >= 5:
+                cx, cy, rx, ry, rot = (
+                    float(data[0]), float(data[1]),
+                    float(data[2]), float(data[3]),
+                    float(data[4]),
+                )
+                gx, gy = self.conv.json_to_game_pos(cx, cy)
+                sx, sy = self.conv.json_to_game_scale(rx, ry)   # ← *2.0 を削除
+                game_rot = (360.0 - rot) % 360.0
+
+                layers.append(LayerRecord(
+                    position_x = gx,
+                    position_y = gy,
+                    scale_x    = sx,
+                    scale_y    = sy,
+                    rotation   = game_rot,
+                    skew       = 0.0,
+                    color_r    = r, color_g = g, color_b = b, color_a = a,
+                    mask       = 0,
+                    shape_id   = SHAPE_ELLIPSE,
+                ))
+            else:
+                print(f"[!] shapes[{i}] type={stype} は未対応、スキップ")
+
+        return layers
+    
+# ---------------------------------------------------------------------------
+# compute_canvas_size — レイヤー群の実測バウンディングボックス
+# ---------------------------------------------------------------------------    
+    
+def compute_canvas_size(layers: list[LayerRecord]) -> tuple[float, float]:
+    """
+    レイヤー群を実際にワールド変換した上でのバウンディングボックスサイズを計算する。
+    VinylFile.canvas_w/canvas_h に「実際にシェイプが占めている範囲」を
+    メタデータとして持たせるために使う（座標変換そのものには影響しない）。
+    """
+    from vinyl_renderer import calc_bbox
+
+    layer_dicts = [l.to_dict() for l in layers]
+    bbox = calc_bbox(layer_dicts)
+    if bbox is None:
+        return 0.0, 0.0
+
+    min_x, min_y, max_x, max_y = bbox
+    return max_x - min_x, max_y - min_y    
+    
 # ---------------------------------------------------------------------------
 # FhvSerializer — .fhv ファイルの読み書き
 # ---------------------------------------------------------------------------
 
 class FhvSerializer:
     """VinylFile ↔ .fhv (JSON) ファイルの変換"""
-
+    
+    @staticmethod
+    def build_vinyl_file(layers: list[LayerRecord]) -> VinylFile:
+        """layersからcanvas_w/canvas_hを実測して VinylFile を構築する共通処理"""
+        w, h = compute_canvas_size(layers)
+        return VinylFile(layers=layers, canvas_w=w, canvas_h=h)
+    
     @staticmethod
     def load_any(path: str | Path, converter: CoordConverter | None = None) -> VinylFile:
         """
@@ -246,8 +344,13 @@ class FhvSerializer:
             data = json.load(f)
 
         if "shapes" in data:
-            layers = ShapesConverter(converter).convert(data)
-            return VinylFile(layers=layers)
+            shapes = data.get("shapes", [])
+            is_geometrize = bool(shapes) and "score" in shapes[0]
+            if is_geometrize:
+                layers = GeometrizeConverter(converter).convert(data)
+            else:
+                layers = ShapesConverter(converter).convert(data)
+            return FhvSerializer.build_vinyl_file(layers)   # ← ここも統一
 
         if "layers" in data or "fhv_version" in data:
             version = data.get("fhv_version", 0)
