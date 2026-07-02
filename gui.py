@@ -7,15 +7,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QSettings
-from PyQt6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
+from PyQt6.QtGui import QColor, QFont, QIntValidator, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QFileDialog, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMainWindow, QPushButton,
+    QHeaderView, QLabel, QLineEdit, QMainWindow, QProgressBar, QPushButton,
     QSizePolicy, QTabWidget, QTableWidget, QTableWidgetItem,
     QTextEdit, QVBoxLayout, QWidget, QComboBox, QFrame, QSplitter,
 )
@@ -74,6 +76,21 @@ STRINGS: dict[str, dict[str, str]] = {
         "settings_language":    "言語 / Language",
         "settings_outdir":      "vinyl フォルダ",
         "btn_browse":           "参照...",
+        "settings_calibration": "オフセット キャリブレーション",
+        "calib_desc":           "FH6のアップデートでツールが動かなくなった場合、ここでオフセットを再検出できます。読み取り専用で、ゲームへの書き込みは行いません。",
+        "calib_prepare":        "FH6内のバイナルエディターに2000〜3000枚のバイナル表示させておいてください。",
+        "calib_count_label":    "正確なレイヤー枚数（分かる場合。任意・2000〜3000）",
+        "calib_count_hint":     "例: 2500（空欄でも可、分かる場合は入力すると高速化します）",
+        "calib_btn":            "キャリブレーション実行",
+        "calib_running":        "キャリブレーション実行中...",
+        "calib_invalid_count":  "レイヤー枚数は2000〜3000の範囲で入力してください（空欄も可）。",
+        "calib_already_running":"キャリブレーションは既に実行中です。",
+        "calib_not_found":      "calibrator.py が見つかりません: {path}",
+        "calib_start":          "キャリブレーションを開始します...",
+        "calib_progress_fmt":   "スキャン中... {scanned}/{total} MB（候補 {n} 件）",
+        "calib_success":        "キャリブレーション完了。結果を保存しました: {path}",
+        "calib_failed":         "キャリブレーション失敗 (code={code})",
+        "calib_failed_generic": "キャリブレーションに失敗しました。ログを確認してください。",
         "log_label":            "ログ",
         "btn_clear_log":        "ログをクリア",
         "log_startup":          "FH6 Vinyl Tool 起動",
@@ -137,6 +154,21 @@ STRINGS: dict[str, dict[str, str]] = {
         "settings_language":    "Language / 言語",
         "settings_outdir":      "Vinyl folder",
         "btn_browse":           "Browse...",
+        "settings_calibration": "Offset Calibration",
+        "calib_desc":           "If the tool stops working after an FH6 update, you can re-detect the offsets here. Read-only — nothing is written to the game.",
+        "calib_prepare":        "Please display about 2000-3000 vinyls in the FH6 vinyl editor.",
+        "calib_count_label":    "Exact layer count (optional, 2000-3000)",
+        "calib_count_hint":     "e.g. 2500 (leave blank if unknown; entering it speeds things up)",
+        "calib_btn":            "Run calibration",
+        "calib_running":        "Calibrating...",
+        "calib_invalid_count":  "Enter a layer count between 2000 and 3000 (or leave it blank).",
+        "calib_already_running":"Calibration is already running.",
+        "calib_not_found":      "calibrator.py not found: {path}",
+        "calib_start":          "Starting calibration...",
+        "calib_progress_fmt":   "Scanning... {scanned}/{total} MB ({n} candidates)",
+        "calib_success":        "Calibration complete. Result saved: {path}",
+        "calib_failed":         "Calibration failed (code={code})",
+        "calib_failed_generic": "Calibration failed. Check the log for details.",
         "log_label":            "Log",
         "btn_clear_log":        "Clear log",
         "log_startup":          "FH6 Vinyl Tool started",
@@ -200,8 +232,9 @@ def get_sub_dir(sub: str) -> Path:
 # ---------------------------------------------------------------------------
 
 class WorkerSignals(QObject):
-    log  = pyqtSignal(str, str)
-    done = pyqtSignal(bool, str)   # (success, saved_path)
+    log      = pyqtSignal(str, str)
+    done     = pyqtSignal(bool, str)   # (success, saved_path)
+    progress = pyqtSignal(int, int, int)   # (scanned_mb, total_mb, candidates) -1,-1,-1 = 不明(indeterminate)
 
 
 class ExportWorker(QThread):
@@ -308,6 +341,103 @@ class ImportWorker(QThread):
         except Exception as e:
             self.signals.log.emit(I18n.t("log_error", e=e), "error")
             self.signals.done.emit(False, "")
+
+
+class CalibrationWorker(QThread):
+    """
+    calibrator.py auto をサブプロセスとして実行するワーカー。
+    - 読み取り専用（calibrator.py自体がゲームへの書き込みを行わない）
+    - calibrator.py の対話プロンプト（Enter確認 / 任意のレイヤー枚数）には
+      起動直後にstdinへまとめて書き込むことで応答する
+    """
+
+    def __init__(self, signals: WorkerSignals, exact_count: int | None) -> None:
+        super().__init__()
+        self.signals     = signals
+        self.exact_count = exact_count
+        self.proc: subprocess.Popen | None = None
+
+    def run(self) -> None:
+        script = BASE_DIR / "calibrator.py"
+        if not script.exists():
+            self.signals.log.emit(I18n.t("calib_not_found", path=str(script)), "error")
+            self.signals.done.emit(False, "")
+            return
+
+        lang_flag = "-jp" if I18n._lang == "ja" else "-en"
+        cmd = [sys.executable, str(script), "auto", lang_flag]
+
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                cwd=str(BASE_DIR),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except Exception as e:
+            self.signals.log.emit(I18n.t("log_error", e=e), "error")
+            self.signals.done.emit(False, "")
+            return
+
+        # calibrator.py 側の入力待ち順序:
+        #   1. input(auto_ready_prompt)          → 準備OKのEnter
+        #   2. prompt_optional_exact_count()     → 正確なレイヤー枚数（空欄可）
+        # パイプはバッファされるので、起動直後にまとめて書き込んでおけばよい。
+        count_line = str(self.exact_count) if self.exact_count else ""
+        try:
+            assert self.proc.stdin is not None
+            self.proc.stdin.write("\n")
+            self.proc.stdin.write(f"{count_line}\n")
+            self.proc.stdin.flush()
+            self.proc.stdin.close()
+        except Exception:
+            pass
+
+        # calibrator.py の "スキャン中... 123/456 MB, 候補=2" 形式の行を検出する。
+        # このパターンに一致する行は大量に流れるため、ログには出さずプログレスバーへ変換する。
+        # 例(ja): "[12:34:56]   スキャン中... 123/456 MB, 候補=2"
+        # 例(en): "[12:34:56]   Scanning... 123/456 MB, candidates=2"
+        progress_re = re.compile(r"(\d+)\s*/\s*(\d+)\s*MB.*?[=＝]\s*(\d+)")
+
+        try:
+            assert self.proc.stdout is not None
+            for raw_line in self.proc.stdout:
+                line = raw_line.rstrip("\n").rstrip("\r")
+                if not line:
+                    continue
+                m = progress_re.search(line)
+                if m:
+                    scanned, total, n = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                    self.signals.progress.emit(scanned, total, n)
+                    continue
+                self.signals.log.emit(f"[calibrator] {line}", "info")
+        except Exception as e:
+            self.signals.log.emit(I18n.t("log_error", e=e), "error")
+
+        code = self.proc.wait()
+
+        if code == 0:
+            saved_path = self._find_latest_result()
+            self.signals.done.emit(True, saved_path)
+        else:
+            self.signals.log.emit(I18n.t("calib_failed", code=code), "error")
+            self.signals.done.emit(False, "")
+
+    def _find_latest_result(self) -> str:
+        """calibrator.py の RESULTS_DIR (= <calibrator.py>/results) から最新結果を探す"""
+        results_dir = BASE_DIR / "results"
+        files = sorted(results_dir.glob("*_result.json"),
+                        key=lambda p: p.name, reverse=True)
+        return str(files[0]) if files else ""
+
+    def cancel(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
 
 
 # ---------------------------------------------------------------------------
@@ -825,7 +955,9 @@ class ImportTab(QWidget):
 class SettingsTab(QWidget):
     def __init__(self, win: "MainWindow") -> None:
         super().__init__()
-        self.win = win
+        self.win         = win
+        self.calib_worker: CalibrationWorker | None = None
+        self.calib_signals: WorkerSignals | None = None
         self._build()
 
     def _build(self) -> None:
@@ -880,7 +1012,113 @@ class SettingsTab(QWidget):
         dir_row.addWidget(self.browse_btn)
         lay.addLayout(dir_row)
 
+        lay.addWidget(divider())
+
+        # --- キャリブレーション ---
+        self.calib_label = section_label(I18n.t("settings_calibration"))
+        lay.addWidget(self.calib_label)
+
+        self.calib_desc = QLabel(I18n.t("calib_desc"))
+        self.calib_desc.setStyleSheet("color:#8b949e;font-size:12px;")
+        self.calib_desc.setWordWrap(True)
+        lay.addWidget(self.calib_desc)
+
+        self.calib_prepare = QLabel(I18n.t("calib_prepare"))
+        self.calib_prepare.setStyleSheet("""
+            color:#d29922; font-size:12px; font-weight:600;
+            background:#2b2111; border:1px solid #3f2f10; border-radius:6px;
+            padding:8px 10px;
+        """)
+        self.calib_prepare.setWordWrap(True)
+        lay.addWidget(self.calib_prepare)
+
+        self.calib_count_label = QLabel(I18n.t("calib_count_label"))
+        self.calib_count_label.setStyleSheet("color:#8b949e;font-size:11px;margin-top:4px;")
+        lay.addWidget(self.calib_count_label)
+
+        self.calib_count_edit = QLineEdit()
+        self.calib_count_edit.setPlaceholderText(I18n.t("calib_count_hint"))
+        self.calib_count_edit.setValidator(QIntValidator(0, 999999, self))
+        self.calib_count_edit.setStyleSheet("""
+            QLineEdit {
+                background:#0d1117; color:#c9d1d9;
+                border:1px solid #30363d; border-radius:6px;
+                padding:6px 10px; font-size:13px;
+            }
+            QLineEdit:focus { border-color:#1f6feb; }
+        """)
+        lay.addWidget(self.calib_count_edit)
+
+        self.calib_btn = QPushButton(I18n.t("calib_btn"))
+        self.calib_btn.setFixedHeight(36)
+        self.calib_btn.setStyleSheet(btn_style("#8957e5", "#a371f7", "#fff", 13, True))
+        self.calib_btn.clicked.connect(self._do_calibration)
+        lay.addWidget(self.calib_btn)
+
+        self.calib_progress = QProgressBar()
+        self.calib_progress.setFixedHeight(22)
+        self.calib_progress.setTextVisible(True)
+        self.calib_progress.setStyleSheet("""
+            QProgressBar {
+                background:#0d1117; color:#c9d1d9;
+                border:1px solid #30363d; border-radius:6px;
+                text-align:center; font-size:11px;
+            }
+            QProgressBar::chunk { background:#8957e5; border-radius:6px; }
+        """)
+        self.calib_progress.setVisible(False)
+        lay.addWidget(self.calib_progress)
+
         lay.addStretch()
+
+    def _do_calibration(self) -> None:
+        if self.calib_worker is not None and self.calib_worker.isRunning():
+            self.win.log.append_log(I18n.t("calib_already_running"), "error")
+            return
+
+        text = self.calib_count_edit.text().strip()
+        exact_count: int | None = None
+        if text:
+            try:
+                n = int(text)
+            except ValueError:
+                n = -1
+            if not (2000 <= n <= 3000):
+                self.win.log.append_log(I18n.t("calib_invalid_count"), "error")
+                return
+            exact_count = n
+
+        self.calib_btn.setEnabled(False)
+        self.calib_btn.setText(I18n.t("calib_running"))
+        self.win.log.append_log(I18n.t("calib_start"), "info")
+
+        self.calib_progress.setVisible(True)
+        self.calib_progress.setRange(0, 0)   # 実際のMB数が分かるまでは不確定(バウンシング)表示
+        self.calib_progress.setFormat("")
+
+        self.calib_signals = WorkerSignals()
+        self.calib_signals.log.connect(self.win.log.append_log)
+        self.calib_signals.done.connect(self._on_calib_done)
+        self.calib_signals.progress.connect(self._on_calib_progress)
+
+        self.calib_worker = CalibrationWorker(self.calib_signals, exact_count)
+        self.calib_worker.start()
+
+    def _on_calib_progress(self, scanned: int, total: int, n: int) -> None:
+        if total > 0:
+            self.calib_progress.setRange(0, total)
+            self.calib_progress.setValue(min(scanned, total))
+        self.calib_progress.setFormat(I18n.t("calib_progress_fmt", scanned=scanned, total=total, n=n))
+
+    def _on_calib_done(self, ok: bool, path: str) -> None:
+        self.calib_btn.setEnabled(True)
+        self.calib_btn.setText(I18n.t("calib_btn"))
+        self.calib_progress.setVisible(False)
+        self.calib_progress.setFormat("")
+        if ok:
+            self.win.log.append_log(I18n.t("calib_success", path=path or "?"), "success")
+        else:
+            self.win.log.append_log(I18n.t("calib_failed_generic"), "error")
 
     def _on_lang(self) -> None:
         lang = self.lang_combo.currentData()
@@ -899,6 +1137,13 @@ class SettingsTab(QWidget):
         self.lang_label.setText(I18n.t("settings_language"))
         self.dir_label.setText(I18n.t("settings_outdir"))
         self.browse_btn.setText(I18n.t("btn_browse"))
+        self.calib_label.setText(I18n.t("settings_calibration"))
+        self.calib_desc.setText(I18n.t("calib_desc"))
+        self.calib_prepare.setText(I18n.t("calib_prepare"))
+        self.calib_count_label.setText(I18n.t("calib_count_label"))
+        self.calib_count_edit.setPlaceholderText(I18n.t("calib_count_hint"))
+        is_running = self.calib_worker is not None and self.calib_worker.isRunning()
+        self.calib_btn.setText(I18n.t("calib_running") if is_running else I18n.t("calib_btn"))
 
 
 # ---------------------------------------------------------------------------
